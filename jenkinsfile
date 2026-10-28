@@ -1,0 +1,138 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'GIT_REPO_URL', defaultValue: 'https://github.com/Aj7Ay/Netflix-clone.git', description: 'Git Repository URL')
+        string(name: 'GIT_BRANCH', defaultValue: 'main', description: 'Git Branch Name')
+        string(name: 'DOCKER_USER', defaultValue: 'rutik', description: 'Docker Hub Username / Organization')
+        string(name: 'IMAGE_NAME', defaultValue: 'netflix', description: 'Docker Image Name')
+        string(name: 'IMAGE_TAG', defaultValue: 'latest', description: 'Docker Image Tag (e.g., latest, v1.0, or $BUILD_NUMBER)')
+        string(name: 'APP_PORT', defaultValue: '8081', description: 'Host Port for Docker Container Deployment')
+        string(name: 'NOTIFICATION_EMAIL', defaultValue: 'rutik@gmail.com', description: 'Email for build status notifications')
+    }
+    environment {
+        SCANNER_HOME = tool 'sonar-scanner'
+        DOCKER_IMAGE = "${params.DOCKER_USER}/${params.IMAGE_NAME}:${params.IMAGE_TAG}"
+    }
+
+    tools {
+        jdk 'jdk17'
+        nodejs 'node16'
+    }
+
+    stages {
+        stage('Clean Workspace') {
+            steps {
+                cleanWs()
+            }
+        }
+
+        stage('Checkout Source Code') {
+            steps {
+                git branch: "${params.GIT_BRANCH}", url: "${params.GIT_REPO_URL}"
+            }
+        }
+
+        stage('SonarQube Code Analysis') {
+            steps {
+                withSonarQubeEnv('sonar-server') {
+                    sh """
+                        $SCANNER_HOME/bin/sonar-scanner \
+                        -Dsonar.projectName=${params.IMAGE_NAME} \
+                        -Dsonar.projectKey=${params.IMAGE_NAME}
+                    """
+                }
+            }
+        }
+
+        stage('Quality Gate Check') {
+            steps {
+                script {
+                    waitForQualityGate abortPipeline: false, credentialsId: 'Sonar-token'
+                }
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                sh "npm install"
+            }
+        }
+
+        stage('OWASP Dependency Check') {
+            steps {
+                dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit', odcInstallation: 'DP-Check'
+                dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+            }
+        }
+
+        stage('Trivy File System Scan') {
+            steps {
+                sh "trivy fs . > trivyfs.txt"
+            }
+        }
+
+        stage('Docker Build & Push') {
+            steps {
+                script {
+                    withCredentials([string(credentialsId: 'tmdb-api-key', variable: 'TMDB_KEY')]) {
+                        withDockerRegistry(credentialsId: 'docker', toolName: 'docker') {   
+                            sh "docker build --build-arg TMDB_V3_API_KEY=${TMDB_KEY} -t ${params.IMAGE_NAME} ."
+                            sh "docker tag ${params.IMAGE_NAME} ${env.DOCKER_IMAGE}"
+                            sh "docker push ${env.DOCKER_IMAGE}"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Trivy Image Scan') {
+            steps {
+                sh "trivy image ${env.DOCKER_IMAGE} > trivyimage.txt" 
+            }
+        }
+
+        stage('Deploy to Container') {
+            steps {
+                script {
+                    sh """
+                        docker stop ${params.IMAGE_NAME} || true
+                        docker rm ${params.IMAGE_NAME} || true
+                        docker run -d --name ${params.IMAGE_NAME} -p ${params.APP_PORT}:80 ${env.DOCKER_IMAGE}
+                    """
+                }
+            }
+        }
+
+        stage('Deploy to Kubernetes') {
+            steps {
+                script {
+                    dir('Kubernetes') {
+                        withKubeConfig(caCertificate: '', clusterName: '', contextName: '', credentialsId: 'k8s', namespace: '', restrictKubeConfigAccess: false, serverUrl: '') {
+                            sh 'kubectl apply -f deployment.yml'
+                            sh 'kubectl apply -f service.yml'
+                        }   
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            emailext attachLog: true,
+                subject: "Build Status: ${currentBuild.result} - ${params.IMAGE_NAME}",
+                body: """
+                    <h3>Project Details:</h3>
+                    <ul>
+                        <li><b>Project:</b> ${env.JOB_NAME}</li>
+                        <li><b>Build Number:</b> ${env.BUILD_NUMBER}</li>
+                        <li><b>Image Tagged:</b> ${env.DOCKER_IMAGE}</li>
+                        <li><b>URL:</b> ${env.BUILD_URL}</li>
+                    </ul>
+                """,
+                to: "${params.NOTIFICATION_EMAIL}",
+                attachmentsPattern: 'trivyfs.txt,trivyimage.txt'
+        }
+    }
+}
